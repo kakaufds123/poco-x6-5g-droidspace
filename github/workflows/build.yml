@@ -1,0 +1,93 @@
+name: Build garnet kernel (BakaSU + Droidspaces)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_commit:
+        description: "Commit do kernel (auto = lido do seu boot.img)"
+        default: "auto"
+      kernel_branch:
+        description: "Branch de fallback se o commit não for achado"
+        default: "lineage-24.0"
+      bakasu_ref:
+        description: "Branch/tag/commit do BakaSU"
+        default: "main"
+      kabi_slot:
+        description: "Slot do patch kABI do SYSVIPC (troque se der bootloop ou o patch não aplicar)"
+        type: choice
+        default: "6_7_8"
+        options: ["6_7_8", "1_2_3", "3_4_5"]
+      lto:
+        description: "thin usa menos RAM/tempo; full = igual ao stock"
+        type: choice
+        default: "thin"
+        options: ["thin", "full"]
+      clang_version:
+        description: "Versão do clang (auto = lida do seu boot.img, ex.: r596125)"
+        default: "auto"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar boot.img
+        run: |
+          if [ -f boot.img.gz ] && [ ! -f boot.img ]; then gunzip -k boot.img.gz; fi
+          [ -f boot.img ] || { echo "::error::Coloque boot.img (ou boot.img.gz) na raiz do repositório."; exit 1; }
+          python3 scripts/bootimg_tool.py info boot.img
+
+      - name: Liberar disco e criar swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          df -h / /mnt | tail -n +1; free -h
+
+      - name: Instalar dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio zip unzip curl patch rsync \
+            python3 build-essential gcc-aarch64-linux-gnu lld llvm clang libncurses-dev
+
+      - name: Compilar kernel
+        env:
+          KERNEL_COMMIT: ${{ inputs.kernel_commit }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+          BAKASU_REF: ${{ inputs.bakasu_ref }}
+          KABI_SLOT: ${{ inputs.kabi_slot }}
+          LTO: ${{ inputs.lto }}
+          CLANG_VERSION: ${{ inputs.clang_version }}
+        run: |
+          set -o pipefail
+          mkdir -p dist
+          bash scripts/build.sh 2>&1 | tee dist/build.log
+
+      - name: Gerar zip AnyKernel3 (opcional)
+        continue-on-error: true
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md modules patch ramdisk LICENSE
+          cp ../dist/Image Image
+          cp ../anykernel/anykernel.sh anykernel.sh
+          zip -r9 ../dist/AK3-garnet-bakasu-droidspaces.zip . -x '.git*'
+
+      - name: Enviar arquivos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garnet-kernel
+          path: |
+            dist/boot_garnet_bakasu_droidspaces.img
+            dist/AK3-garnet-bakasu-droidspaces.zip
+            dist/Image
+            dist/final.config
+            dist/config.diff
+            dist/build.log
+            dist/SHA256SUMS
+          if-no-files-found: warn
